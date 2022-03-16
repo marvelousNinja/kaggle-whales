@@ -11,13 +11,11 @@ class TensorboardMonitor(Callback):
         self.visualize_fn = visualize_fn
 
     def on_train_batch_end(self, logs, outputs, batch):
-        pass
-        # if (self.batch_counter % 100 == 0) and self.batch_counter > 0:
-        #     self.batch_counter += 1
-        #     self.visualize_fn(self.writer, 'train', outputs, batch, self.batch_counter)
-        # else:
-        #     self.batch_counter += 1
-        #     return
+        if (self.batch_counter % 100 == 0) and self.batch_counter > 0:
+            self.batch_counter += 1
+            self.visualize_fn(self.writer, 'train', outputs, batch, self.batch_counter)
+        else:
+            self.batch_counter += 1
 
     def on_validation_batch_end(self, logs, outputs, batch):
         # TODO AS: For now, log every batch in validation for timelapse logs
