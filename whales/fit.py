@@ -220,7 +220,7 @@ class TripletLoss(object):
         return loss, dist_ap, dist_an
 
 def compute_loss(outputs, batch):
-    id_loss = torch.nn.functional.cross_entropy(outputs['individual_logits'], batch['individual_label'])
+    id_loss = torch.nn.functional.cross_entropy(outputs['individual_logits'], batch['individual_label'], label_smoothing=0.1)
     triplet_loss = TripletLoss(margin=0.3)(outputs['features'], batch['individual_label'])[0]
     total_loss = id_loss + triplet_loss
     return {'total_loss': total_loss, 'id_loss': id_loss, 'triplet_loss': triplet_loss}
