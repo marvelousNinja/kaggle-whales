@@ -35,7 +35,7 @@ class ModelCheckpoint(Callback):
         else:
             update_needed = self.value < value
 
-        # save_checkpoint(self.model, f'{self.experiment_dir}/last.pth')
+        save_checkpoint(self.model, f'{self.experiment_dir}/last.pth')
 
         if update_needed:
             save_checkpoint(self.model, f'{self.experiment_dir}/best.pth')
