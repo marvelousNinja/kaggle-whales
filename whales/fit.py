@@ -11,6 +11,7 @@ import json
 
 import albumentations
 import cv2; cv2.setNumThreads(0)
+import faiss
 from fire import Fire
 import numpy as np
 import pandas as pd
@@ -278,21 +279,26 @@ class MeanAveragePrecision(Callback):
         self.features = []
         self.query_individual_ids = []
         self.query_features = []
+        self.index = None
 
     def on_train_batch_end(self, logs, outputs, batch):
         self.individual_ids.extend(batch['individual_id'])
-        self.features.extend(outputs['features'].detach().cpu().numpy())
+        self.features.extend(torch.nn.functional.normalize(outputs['features'].detach()).cpu().numpy())
 
     def on_validation_batch_end(self, logs, outputs, batch):
-        if not isinstance(self.features, np.ndarray):
-            self.features = np.stack(self.features).astype(np.float32)
+        if not type(self.features) is np.ndarray:
+            self.features = np.stack(self.features)
             self.individual_ids = np.array(self.individual_ids)
+            self.index = faiss.IndexFlatIP(self.features.shape[-1])
+            self.index.add(self.features.astype(np.float32))
+            res = faiss.StandardGpuResources()
+            self.index = faiss.index_cpu_to_gpu(res, 0, self.index)
+
 
         query_individual_ids = np.array(batch['individual_id'])
-        query_features = outputs['features'].detach().cpu().numpy().astype(np.float32)
+        query_features = torch.nn.functional.normalize(outputs['features']).cpu().numpy().astype(np.float32)
 
-        similarity_matrix = sklearn.metrics.pairwise.cosine_similarity(query_features, self.features)
-        top_matches = similarity_matrix.argsort()[:, ::-1]
+        _, top_matches = self.index.search(query_features, k=5)
 
         for i in range(len(top_matches)):
             # TODO AS: Keep only unique matches
@@ -308,6 +314,7 @@ class MeanAveragePrecision(Callback):
 
     def on_epoch_end(self, logs):
         logs['val_mAP'] = self.total / self.num_records
+        self.index = None
 
 def fit(
     name='default',
