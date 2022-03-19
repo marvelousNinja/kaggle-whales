@@ -21,6 +21,7 @@ from torch import nn
 import torch.utils.data.dataloader
 from torch.utils.data import Dataset, DataLoader
 
+from fyx.callbacks.callback import Callback
 from fyx.callbacks.meter import Meter
 from fyx.callbacks.cyclic_lr import CyclicLR
 from fyx.callbacks.dump import Dump
@@ -235,7 +236,9 @@ def transform(input_shape, augment, debug, mapping, num_images_per_identity, rec
     if augment:
         image_paths = np.random.choice(record['image_paths'], size=num_images_per_identity, replace=True)
     else:
-        image_paths = record['image_paths'][:num_images_per_identity]
+        # TODO AS: Make this deterministic
+        image_paths = np.random.choice(record['image_paths'], size=num_images_per_identity, replace=True)
+        # image_paths = record['image_paths'][:num_images_per_identity]
 
     for image_path in image_paths:
         image = cv2.imread(image_path)
@@ -264,35 +267,47 @@ def transform(input_shape, augment, debug, mapping, num_images_per_identity, rec
 
     return records
 
-def mean_average_precision(outputs, batch):
-    values = []
+class MeanAveragePrecision(Callback):
+    def __init__(self):
+        pass
 
-    for i in range(len(batch['image'])):
-        values.append({
-            'image_name': batch['image_name'][i],
-            'individual_label': batch['individual_label'][i].item(),
-            'features': outputs['features'][i].cpu().numpy()
-        })
+    def on_epoch_begin(self, logs):
+        self.total = 0
+        self.num_records = 0
+        self.individual_ids = []
+        self.features = []
+        self.query_individual_ids = []
+        self.query_features = []
 
-    return values
+    def on_train_batch_end(self, logs, outputs, batch):
+        self.individual_ids.extend(batch['individual_id'])
+        self.features.extend(outputs['features'].detach().cpu().numpy())
 
-def reduce_map(records):
-    # TODO AS: This is implemented in numpy and duplicates torch stuff in visualise_preds
-    df = pd.DataFrame(sum(records, []))
-    all_labels = df['individual_label']
-    all_features = np.stack(df['features'].values)
-    similarity_matrix = sklearn.metrics.pairwise.cosine_similarity(all_features, all_features)
-    np.fill_diagonal(similarity_matrix, -1.0)
-    top_matches = similarity_matrix.argsort()[:, ::-1][:, :5]
-    mapped_matches = all_labels[:, None][top_matches][:, :, 0]
+    def on_validation_batch_end(self, logs, outputs, batch):
+        if not isinstance(self.features, np.ndarray):
+            self.features = np.stack(self.features).astype(np.float32)
+            self.individual_ids = np.array(self.individual_ids)
 
-    total = 0
-    for i in range(len(top_matches)):
-        if all_labels[i] in mapped_matches[i]:
-            total += 1.0
+        query_individual_ids = np.array(batch['individual_id'])
+        query_features = outputs['features'].detach().cpu().numpy().astype(np.float32)
 
-    total /= len(top_matches)
-    return total
+        similarity_matrix = sklearn.metrics.pairwise.cosine_similarity(query_features, self.features)
+        top_matches = similarity_matrix.argsort()[:, ::-1]
+
+        for i in range(len(top_matches)):
+            # TODO AS: Keep only unique matches
+            # list(dict.fromkeys(top_matches[i]))[:5]
+            record_matches = top_matches[i][:5]
+            mapped_record_matches = self.individual_ids[record_matches]
+            self.num_records += 1
+
+            for j in range(5):
+                if mapped_record_matches[j] == query_individual_ids[i]:
+                    self.total += (1.0 / (j + 1))
+                    break
+
+    def on_epoch_end(self, logs):
+        logs['val_mAP'] = self.total / self.num_records
 
 def fit(
     name='default',
@@ -333,7 +348,7 @@ def fit(
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-    torch.autograd.set_detect_anomaly(debug)
+    # torch.autograd.set_detect_anomaly(debug)
 
     logger, _ = make_loggers(False)
 
@@ -376,18 +391,20 @@ def fit(
     })
 
     df['image_count'] = df['individual_id'].map(df.groupby('individual_id')['image'].count())
-
-    fold_mapping = dict(zip(df['individual_id'].unique(), np.random.randint(0, num_folds, len(df['individual_id'].unique()))))
-    df['fold_id'] = df['individual_id'].map(fold_mapping)
     label_mapping = dict(zip(df['individual_id'].unique(), np.arange(len(df['individual_id'].unique()))))
-    df['image_paths'] = df['individual_id'].map(df.groupby('individual_id')['image_path'].apply(list))
 
-    df = df.drop_duplicates('individual_id').copy()
+    # I.e. the same identity can span multiple folds
+    df['fold_id'] = np.random.randint(0, num_folds, len(df))
     df['weight'] = 1.0
 
-    train_df = df[df['fold_id'].isin(train_fold_ids)].sample(frac=1.0)
-    val_df = df[df['fold_id'].isin(validation_fold_ids)]
-    val_df = val_df[val_df['image_count'] == num_images_per_identity]
+    # TODO AS: What is the ratio of "unlabeled" identities? Probe the LB? We can try to tweak it.
+    train_df = df[df['fold_id'].isin(train_fold_ids)].copy()
+    train_df['image_paths'] = train_df['individual_id'].map(train_df.groupby('individual_id')['image_path'].apply(list))
+    train_df = train_df.drop_duplicates('individual_id')
+
+    val_df = df[df['fold_id'].isin(validation_fold_ids)].copy()
+    val_df['image_paths'] = val_df['individual_id'].map(val_df.groupby('individual_id')['image_path'].apply(list))
+    val_df = val_df.drop_duplicates('individual_id')
 
     train_dataset = TransformedDataset(train_df[:limit], partial(transform, input_shape, True, debug, label_mapping, num_images_per_identity))
     validation_dataset = TransformedDataset(val_df, partial(transform, val_input_shape, False, debug, label_mapping, num_images_per_identity))
@@ -424,16 +441,16 @@ def fit(
         batch_size=validation_batch_size,
         drop_last=True,
         shuffle=False,
-        num_workers=num_workers // 2,
+        num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_fn
     )
 
     callbacks = [
-        Meter('mAP', map_fn=mean_average_precision, reduce_fn=reduce_map, reduce_once=True, only_val=True),
+        MeanAveragePrecision(),
         ModelCheckpoint(model.model, experiment_path, 'val_mAP', 'max', logger),
         TensorboardMonitor(experiment_path, visualize_fn=visualize_preds),
-        # LRSchedule(optimizer, [(0, lr), (15, lr / 5), (50, lr / 10)], logger),
+        LRSchedule(optimizer, [(0, lr), (40, lr / 10), (70, lr / 100)], logger),
         # Dump(lambda logs: str(logs['val_mAP_all']), 'out.txt')
     ]
 
