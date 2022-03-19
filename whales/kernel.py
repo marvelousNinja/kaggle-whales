@@ -3,6 +3,7 @@ from functools import partial
 
 import albumentations
 import cv2
+import faiss
 import tqdm
 import glob
 import numpy as np
@@ -134,18 +135,21 @@ def predict(
         batch = from_numpy(batch)
         outputs = model(batch)
 
-        for i in range(len(batch['image'])):
-            features.append(outputs['features'][i].detach().cpu().numpy())
+        batch_features = torch.nn.functional.normalize(outputs['features'].detach()).cpu().numpy()
+        features.extend(batch_features)
 
     combined_df['features'] = features
 
     train_df = combined_df[combined_df['individual_id'].notnull()]
     test_df = combined_df[~combined_df['individual_id'].notnull()]
 
+    index = faiss.IndexFlatIP(outputs['features'].shape[-1])
+    index.add(np.stack(train_df['features'].values))
+    res = faiss.StandardGpuResources()
+    index = faiss.index_cpu_to_gpu(res, 0, index)
+
     all_labels = train_df['individual_id']
-    similarity_matrix = sklearn.metrics.pairwise.cosine_similarity(np.stack(test_df['features'].values), np.stack(train_df['features'].values))
-    np.fill_diagonal(similarity_matrix, -1.0)
-    top_matches = similarity_matrix.argsort()[:, ::-1][:, :5]
+    _, top_matches = index.search(np.stack(test_df['features'].values), k=5)
     mapped_matches = all_labels[:, None][top_matches][:, :, 0]
     mapped_matches = list(map(lambda arr: ' '.join(arr), mapped_matches))
     pd.DataFrame({'image': test_df['image_name'], 'predictions': mapped_matches}).to_csv(submission_path, index=False)
