@@ -21,7 +21,8 @@ class TensorboardMonitor(Callback):
         # TODO AS: For now, log every batch in validation for timelapse logs
         # This assumes that images in validation are unique
         # TODO AS: Optionally disable? Slows the training down..
-        self.visualize_fn(self.writer, 'val', outputs, batch, self.epoch_counter)
+        # self.visualize_fn(self.writer, 'val', outputs, batch, self.epoch_counter)
+        pass
 
     def on_epoch_end(self, logs):
         for key, value in logs.items():
