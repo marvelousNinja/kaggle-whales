@@ -1,12 +1,7 @@
-import contextlib
-from collections import defaultdict
 from datetime import datetime
-from functools import partial, reduce
-from itertools import product
-
+from functools import partial
 import math
 import os
-import operator
 import random
 import json
 
@@ -16,24 +11,20 @@ import faiss
 from fire import Fire
 import numpy as np
 import pandas as pd
-import sklearn.metrics.pairwise
 import timm
 import torch
 from torch import nn
-import torch.nn.functional as F
 import torch.utils.data.dataloader
 from torch.utils.data import Dataset, DataLoader
 
 from fyx.callbacks.callback import Callback
-from fyx.callbacks.meter import Meter
 from fyx.callbacks.cyclic_lr import CyclicLR
-from fyx.callbacks.dump import Dump
 from fyx.callbacks.model_checkpoint import ModelCheckpoint, load_checkpoint
 from fyx.callbacks.tensorboard_monitor import TensorboardMonitor
 from fyx.callbacks.lr_schedule import LRSchedule
 from fyx.loggers import make_loggers
 from fyx.training import fit_model
-from fyx.utils import as_cuda, to_numpy
+from fyx.utils import as_cuda
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
@@ -53,50 +44,48 @@ class TransformedDataset(Dataset):
     def __len__(self):
         return len(self.records)
 
-class ArcMarginProduct(nn.Module):
-    r"""Implement of large margin arc distance: :
-        Args:
-            in_features: size of each input sample
-            out_features: size of each output sample
-            s: norm of input feature
-            m: margin
-            cos(theta + m)
-        """
-    def __init__(self, in_features, out_features, s=30.0,
-                 m=0.50, easy_margin=False, ls_eps=0.0):
-        super(ArcMarginProduct, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.s = s
-        self.m = m
-        self.ls_eps = ls_eps  # label smoothing
+class ArcfaceHead(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
 
-        self.easy_margin = easy_margin
-        self.cos_m = math.cos(m)
-        self.sin_m = math.sin(m)
-        self.th = math.cos(math.pi - m)
-        self.mm = math.sin(math.pi - m) * m
+    def forward(self, features):
+        cosine = torch.nn.functional.linear(torch.nn.functional.normalize(features), torch.nn.functional.normalize(self.weight))
+        return cosine
 
-    def forward(self, input, weight, label):
-        # --------------------------- cos(theta) & phi(theta) ---------------------
-        cosine = F.linear(F.normalize(input), F.normalize(weight))
-        sine = torch.sqrt(1.0 - torch.pow(cosine, 2)).to(cosine)
-        phi = cosine * self.cos_m - sine * self.sin_m
-        if self.easy_margin:
-            phi = torch.where(cosine > 0, phi, cosine)
+def arcface_loss(logits, labels, s=30.0, m=0.50):
+    cos_m = math.cos(m)
+    sin_m = math.sin(m)
+    th = math.cos(math.pi - m)
+    mm = math.sin(math.pi - m) * m
+
+    cosine = logits
+    sine = torch.sqrt(1.0 - torch.pow(cosine, 2))
+    phi = cosine * cos_m - sine * sin_m
+    phi = torch.where(cosine > th, phi, cosine - mm)
+
+    labels2 = torch.zeros_like(cosine)
+    labels2.scatter_(1, labels.view(-1, 1).long(), 1)
+    output = (labels2 * phi) + ((1.0 - labels2) * cosine)
+
+    output = output * s
+    return torch.nn.functional.cross_entropy(output, labels)
+
+def gem(x, p=3, eps=1e-6):
+    return torch.nn.functional.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1./p)
+
+class GeM(nn.Module):
+    def __init__(self, p=3, eps=1e-6, p_trainable=True):
+        super(GeM,self).__init__()
+        if p_trainable:
+            self.p = torch.nn.Parameter(torch.ones(1)*p)
         else:
-            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
-        # --------------------------- convert label to one-hot ---------------------
-        # one_hot = torch.zeros(cosine.size(), requires_grad=True, device='cuda')
-        one_hot = torch.zeros(cosine.size(), device='cuda')
-        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
-        if self.ls_eps > 0:
-            one_hot = (1 - self.ls_eps) * one_hot + self.ls_eps / self.out_features
-        # -------------torch.where(out_i = {x_i if condition_i else y_i) ------------
-        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
-        output *= self.s
+            self.p = p
+        self.eps = eps
 
-        return output
+    def forward(self, x):
+        return gem(x, p=self.p, eps=self.eps)
 
 class WhaleNet(torch.nn.Module):
     def __init__(self, model):
@@ -104,36 +93,50 @@ class WhaleNet(torch.nn.Module):
         self.model = model
 
     def forward(self, x):
-        features, logits, centers = self.model(x['image'])
+        features, logits = self.model(x['image'])
         return {
             'features': features,
-            'individual_logits': logits,
-            'centers': centers
+            'individual_logits': logits
         }
 
 class InnerNet(torch.nn.Module):
-    def __init__(self, input_shape, encoder_name, encoder_weights, num_identities, use_bn_l2):
+    def __init__(self, input_shape, encoder_name, encoder_weights, num_identities, global_pool, neck, classifier):
         super().__init__()
         self.model = timm.create_model(encoder_name, pretrained=encoder_weights is not None)
         self.input_shape = input_shape
-        self.fc = torch.nn.Linear(self.model.num_features, num_identities, bias=not use_bn_l2)
-        self.pool = torch.nn.Sequential(
-            torch.nn.AdaptiveAvgPool2d((1, 1)),
-            torch.nn.Flatten()
-        )
-        self.bn = torch.nn.BatchNorm1d(self.model.num_features)
 
-        self.use_bn_l2 = use_bn_l2
+        self.global_pool = {
+            'avg_pool': lambda: torch.nn.Sequential(
+                torch.nn.AdaptiveAvgPool2d((1, 1)),
+                torch.nn.Flatten()
+            ),
+            'gem': lambda: torch.nn.Sequential(
+                GeM(),
+                torch.nn.Flatten()
+            )
+        }[global_pool]()
 
-        self.centers = nn.Parameter(torch.FloatTensor(num_identities, self.model.num_features))
-        nn.init.xavier_uniform_(self.centers)
+        self.neck = {
+            'identity': lambda: torch.nn.Identity(),
+            'prelu': lambda: torch.nn.Sequential(
+                torch.nn.Linear(self.model.num_features, 512),
+                torch.nn.BatchNorm1d(512),
+                torch.nn.PReLU()
+            )
+        }[neck]()
+
+        emgedding_size = self.model.num_features if neck == 'identity' else 512
+
+        self.classifier = {
+            'arcface': lambda: ArcfaceHead(emgedding_size, num_identities),
+            'fc': lambda: torch.nn.Linear(emgedding_size, num_identities)
+        }[classifier]()
 
     def forward(self, x):
-        features = self.pool(self.model.forward_features(x))
-        if self.use_bn_l2:
-            features = torch.nn.functional.normalize(self.bn(features))
-        logits = self.fc(features)
-        return features, logits, self.centers
+        features = self.global_pool(self.model.forward_features(x))
+        features = self.neck(features)
+        logits = self.classifier(features)
+        return features, logits
 
     def sample_input(self):
         return torch.randint(255, size=(1, 3, *self.input_shape)).float().to(next(self.parameters()).device)
@@ -279,11 +282,7 @@ class TripletLoss(object):
 
 def compute_loss(outputs, batch, use_arcface, use_triplet):
     if use_arcface:
-        logits = ArcMarginProduct(
-            outputs['features'].shape[-1],
-            outputs['individual_logits'].shape[-1]
-        )(outputs['features'], outputs['centers'], batch['individual_label'])
-        id_loss = torch.nn.functional.cross_entropy(logits, batch['individual_label'])
+        id_loss = arcface_loss(outputs['individual_logits'], batch['individual_label'])
     else:
         id_loss = torch.nn.functional.cross_entropy(outputs['individual_logits'], batch['individual_label'], label_smoothing=0.1)
 
@@ -409,9 +408,10 @@ def fit(
     num_images_per_identity=4,
     use_phalanx_dataset=False,
     enable_flips=True,
-    use_bn_l2=True,
-    use_arcface=False,
     use_triplet=True,
+    neck='identity',
+    classifier='fc',
+    global_pool='avg_pool',
     **kwargs
 ):
     assert len(kwargs) == 0, f'Unrecognized args: {kwargs}'
@@ -448,7 +448,10 @@ def fit(
     if checkpoint_path:
         model = WhaleNet(load_checkpoint(checkpoint_path))
     else:
-        model = WhaleNet(InnerNet(input_shape, encoder_name, encoder_weights, num_identities=len(df['individual_id'].unique()), use_bn_l2=use_bn_l2))
+        model = WhaleNet(InnerNet(
+            input_shape, encoder_name, encoder_weights,
+            num_identities=len(df['individual_id'].unique()), global_pool=global_pool, neck=neck, classifier=classifier
+        ))
 
     model = as_cuda(model)
 
@@ -489,7 +492,7 @@ def fit(
     train_dataset = TransformedDataset(train_df[:limit], partial(transform, input_shape, True, debug, label_mapping, num_images_per_identity, enable_flips))
     validation_dataset = TransformedDataset(val_df, partial(transform, val_input_shape, False, debug, label_mapping, num_images_per_identity, enable_flips))
 
-    num_workers = 16 if torch.cuda.is_available() and not debug else 0
+    num_workers = 4 if torch.cuda.is_available() and not debug else 0
 
     # TODO AS: `validation_limit` strictly selects subset for all epochs
     # but `limit` limits number of samples per epoch, while preserving the dataset
@@ -530,8 +533,7 @@ def fit(
         MeanAveragePrecision(),
         ModelCheckpoint(model.model, experiment_path, 'val_mAP', 'max', logger),
         TensorboardMonitor(experiment_path, visualize_fn=visualize_preds),
-        LRSchedule(optimizer, [(0, lr), (40, lr / 10), (70, lr / 100)], logger),
-        # Dump(lambda logs: str(logs['val_mAP_all']), 'out.txt')
+        LRSchedule(optimizer, [(0, lr), (40, lr / 10), (70, lr / 100)], logger)
     ]
 
     if cyclic_lr:
@@ -542,7 +544,7 @@ def fit(
         train_dataloader=train_dataloader,
         validation_dataloader=validation_dataloader,
         optimizer=optimizer,
-        loss_fn=partial(compute_loss, use_arcface=use_arcface, use_triplet=use_triplet),
+        loss_fn=partial(compute_loss, use_arcface=classifier=='arcface', use_triplet=use_triplet),
         num_epochs=num_epochs,
         logger=logger,
         callbacks=callbacks,
