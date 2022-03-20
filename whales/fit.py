@@ -4,6 +4,7 @@ from datetime import datetime
 from functools import partial, reduce
 from itertools import product
 
+import math
 import os
 import operator
 import random
@@ -19,6 +20,7 @@ import sklearn.metrics.pairwise
 import timm
 import torch
 from torch import nn
+import torch.nn.functional as F
 import torch.utils.data.dataloader
 from torch.utils.data import Dataset, DataLoader
 
@@ -51,33 +53,87 @@ class TransformedDataset(Dataset):
     def __len__(self):
         return len(self.records)
 
+class ArcMarginProduct(nn.Module):
+    r"""Implement of large margin arc distance: :
+        Args:
+            in_features: size of each input sample
+            out_features: size of each output sample
+            s: norm of input feature
+            m: margin
+            cos(theta + m)
+        """
+    def __init__(self, in_features, out_features, s=30.0,
+                 m=0.50, easy_margin=False, ls_eps=0.0):
+        super(ArcMarginProduct, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.ls_eps = ls_eps  # label smoothing
+
+        self.easy_margin = easy_margin
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+
+    def forward(self, input, weight, label):
+        # --------------------------- cos(theta) & phi(theta) ---------------------
+        cosine = F.linear(F.normalize(input), F.normalize(weight))
+        sine = torch.sqrt(1.0 - torch.pow(cosine, 2)).to(cosine)
+        phi = cosine * self.cos_m - sine * self.sin_m
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+        # --------------------------- convert label to one-hot ---------------------
+        # one_hot = torch.zeros(cosine.size(), requires_grad=True, device='cuda')
+        one_hot = torch.zeros(cosine.size(), device='cuda')
+        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+        if self.ls_eps > 0:
+            one_hot = (1 - self.ls_eps) * one_hot + self.ls_eps / self.out_features
+        # -------------torch.where(out_i = {x_i if condition_i else y_i) ------------
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output *= self.s
+
+        return output
+
 class WhaleNet(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
 
     def forward(self, x):
-        features, logits = self.model(x['image'])
+        features, logits, centers = self.model(x['image'])
         return {
             'features': features,
-            'individual_logits': logits
+            'individual_logits': logits,
+            'centers': centers
         }
 
 class InnerNet(torch.nn.Module):
-    def __init__(self, input_shape, encoder_name, encoder_weights, num_identities):
+    def __init__(self, input_shape, encoder_name, encoder_weights, num_identities, use_bn_l2):
         super().__init__()
         self.model = timm.create_model(encoder_name, pretrained=encoder_weights is not None)
         self.input_shape = input_shape
-        self.fc = torch.nn.Linear(self.model.num_features, num_identities)
+        self.fc = torch.nn.Linear(self.model.num_features, num_identities, bias=not use_bn_l2)
         self.pool = torch.nn.Sequential(
             torch.nn.AdaptiveAvgPool2d((1, 1)),
             torch.nn.Flatten()
         )
+        self.bn = torch.nn.BatchNorm1d(self.model.num_features)
+
+        self.use_bn_l2 = use_bn_l2
+
+        self.centers = nn.Parameter(torch.FloatTensor(num_identities, self.model.num_features))
+        nn.init.xavier_uniform_(self.centers)
 
     def forward(self, x):
         features = self.pool(self.model.forward_features(x))
+        if self.use_bn_l2:
+            features = torch.nn.functional.normalize(self.bn(features))
         logits = self.fc(features)
-        return features, logits
+        return features, logits, self.centers
 
     def sample_input(self):
         return torch.randint(255, size=(1, 3, *self.input_shape)).float().to(next(self.parameters()).device)
@@ -221,14 +277,22 @@ class TripletLoss(object):
             loss = self.ranking_loss(dist_an - dist_ap, y)
         return loss, dist_ap, dist_an
 
-def compute_loss(outputs, batch):
-    id_loss = torch.nn.functional.cross_entropy(outputs['individual_logits'], batch['individual_label'], label_smoothing=0.1)
-    triplet_loss = TripletLoss(margin=0.3)(outputs['features'], batch['individual_label'])[0]
+def compute_loss(outputs, batch, use_arcface, use_triplet):
+    if use_arcface:
+        logits = ArcMarginProduct(
+            outputs['features'].shape[-1],
+            outputs['individual_logits'].shape[-1]
+        )(outputs['features'], outputs['centers'], batch['individual_label'])
+        id_loss = torch.nn.functional.cross_entropy(logits, batch['individual_label'])
+    else:
+        id_loss = torch.nn.functional.cross_entropy(outputs['individual_logits'], batch['individual_label'], label_smoothing=0.1)
+
+    triplet_loss = TripletLoss(margin=0.3)(outputs['features'], batch['individual_label'])[0] * float(use_triplet)
     total_loss = id_loss + triplet_loss
     return {'total_loss': total_loss, 'id_loss': id_loss, 'triplet_loss': triplet_loss}
 
 
-def transform(input_shape, augment, debug, mapping, num_images_per_identity, record):
+def transform(input_shape, augment, debug, mapping, num_images_per_identity, enable_flips, record):
     if debug:
         import pdb; pdb.set_trace()
 
@@ -249,7 +313,7 @@ def transform(input_shape, augment, debug, mapping, num_images_per_identity, rec
                 albumentations.Resize(input_shape[0], input_shape[1]),
                 albumentations.PadIfNeeded(input_shape[0] + 20, input_shape[1] + 20),
                 albumentations.RandomCrop(height=input_shape[0], width=input_shape[1], p=1.0),
-                albumentations.HorizontalFlip(p=0.5)
+                albumentations.HorizontalFlip(p=int(enable_flips) / 2.0)
             ]
         else:
             steps = [
@@ -343,6 +407,11 @@ def fit(
     profile=False,
     num_identities=16,
     num_images_per_identity=4,
+    use_phalanx_dataset=False,
+    enable_flips=True,
+    use_bn_l2=True,
+    use_arcface=False,
+    use_triplet=True,
     **kwargs
 ):
     assert len(kwargs) == 0, f'Unrecognized args: {kwargs}'
@@ -379,7 +448,7 @@ def fit(
     if checkpoint_path:
         model = WhaleNet(load_checkpoint(checkpoint_path))
     else:
-        model = WhaleNet(InnerNet(input_shape, encoder_name, encoder_weights, num_identities=len(df['individual_id'].unique())))
+        model = WhaleNet(InnerNet(input_shape, encoder_name, encoder_weights, num_identities=len(df['individual_id'].unique()), use_bn_l2=use_bn_l2))
 
     model = as_cuda(model)
 
@@ -389,7 +458,11 @@ def fit(
         'adamw': lambda: torch.optim.AdamW(filter(lambda param: param.requires_grad, model.parameters()), lr),
     }[optimizer_name]()
 
-    df['image_path'] = './data/train_images/' + df['image']
+    if use_phalanx_dataset:
+        df['image_path'] = './data/cropped_train_images/cropped_train_images/' + df['image']
+    else:
+        df['image_path'] = './data/train_images/' + df['image']
+
     df['species'] = df['species'].replace({
         'globis': 'short_finned_pilot_whale',
         'pilot_whale': 'short_finned_pilot_whale',
@@ -413,8 +486,8 @@ def fit(
     val_df['image_paths'] = val_df['individual_id'].map(val_df.groupby('individual_id')['image_path'].apply(list))
     val_df = val_df.drop_duplicates('individual_id')
 
-    train_dataset = TransformedDataset(train_df[:limit], partial(transform, input_shape, True, debug, label_mapping, num_images_per_identity))
-    validation_dataset = TransformedDataset(val_df, partial(transform, val_input_shape, False, debug, label_mapping, num_images_per_identity))
+    train_dataset = TransformedDataset(train_df[:limit], partial(transform, input_shape, True, debug, label_mapping, num_images_per_identity, enable_flips))
+    validation_dataset = TransformedDataset(val_df, partial(transform, val_input_shape, False, debug, label_mapping, num_images_per_identity, enable_flips))
 
     num_workers = 16 if torch.cuda.is_available() and not debug else 0
 
@@ -469,7 +542,7 @@ def fit(
         train_dataloader=train_dataloader,
         validation_dataloader=validation_dataloader,
         optimizer=optimizer,
-        loss_fn=compute_loss,
+        loss_fn=partial(compute_loss, use_arcface=use_arcface, use_triplet=use_triplet),
         num_epochs=num_epochs,
         logger=logger,
         callbacks=callbacks,
