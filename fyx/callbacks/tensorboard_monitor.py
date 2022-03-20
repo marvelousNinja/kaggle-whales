@@ -11,6 +11,7 @@ class TensorboardMonitor(Callback):
         self.visualize_fn = visualize_fn
 
     def on_train_batch_end(self, logs, outputs, batch):
+        return
         if (self.batch_counter % 100 == 0) and self.batch_counter > 0:
             self.batch_counter += 1
             self.visualize_fn(self.writer, 'train', outputs, batch, self.batch_counter)
