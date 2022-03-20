@@ -412,6 +412,7 @@ def fit(
     neck='identity',
     classifier='fc',
     global_pool='avg_pool',
+    lr_schedule='regular',
     **kwargs
 ):
     assert len(kwargs) == 0, f'Unrecognized args: {kwargs}'
@@ -492,7 +493,7 @@ def fit(
     train_dataset = TransformedDataset(train_df[:limit], partial(transform, input_shape, True, debug, label_mapping, num_images_per_identity, enable_flips))
     validation_dataset = TransformedDataset(val_df, partial(transform, val_input_shape, False, debug, label_mapping, num_images_per_identity, enable_flips))
 
-    num_workers = 4 if torch.cuda.is_available() and not debug else 0
+    num_workers = 16 if torch.cuda.is_available() and not debug else 0
 
     # TODO AS: `validation_limit` strictly selects subset for all epochs
     # but `limit` limits number of samples per epoch, while preserving the dataset
@@ -529,11 +530,16 @@ def fit(
         collate_fn=collate_fn
     )
 
+    lr_schedule = {
+        'regular': lambda:[(0, lr), (40, lr / 10), (70, lr / 100)],
+        'warmup': lambda: [*[(i, lr / (10 - i)) for i in range(10)], (40, lr / 10), (70, lr / 100)]
+    }[lr_schedule]()
+
     callbacks = [
         MeanAveragePrecision(),
         ModelCheckpoint(model.model, experiment_path, 'val_mAP', 'max', logger),
+        LRSchedule(optimizer, lr_schedule, logger),
         TensorboardMonitor(experiment_path, visualize_fn=visualize_preds),
-        LRSchedule(optimizer, [(0, lr), (40, lr / 10), (70, lr / 100)], logger)
     ]
 
     if cyclic_lr:
