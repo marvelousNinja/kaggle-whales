@@ -47,12 +47,39 @@ class TransformedDataset(Dataset):
 class ArcfaceHead(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
-        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, features):
         cosine = torch.nn.functional.linear(torch.nn.functional.normalize(features), torch.nn.functional.normalize(self.weight))
         return cosine
+
+def pairwise_cosface(
+        embedding: torch.Tensor,
+        targets: torch.Tensor,
+        margin: float,
+        gamma: float, ) -> torch.Tensor:
+    # Normalize embedding features
+    embedding = torch.nn.functional.normalize(embedding, dim=1)
+
+    dist_mat = torch.matmul(embedding, embedding.t())
+
+    N = dist_mat.size(0)
+    is_pos = targets.view(N, 1).expand(N, N).eq(targets.view(N, 1).expand(N, N).t()).float()
+    is_neg = targets.view(N, 1).expand(N, N).ne(targets.view(N, 1).expand(N, N).t()).float()
+
+    # Mask scores related to itself
+    is_pos = is_pos - torch.eye(N, N, device=is_pos.device)
+
+    s_p = dist_mat * is_pos
+    s_n = dist_mat * is_neg
+
+    logit_p = -gamma * s_p + (-99999999.) * (1 - is_pos)
+    logit_n = gamma * (s_n + margin) + (-99999999.) * (1 - is_neg)
+
+    loss = torch.nn.functional.softplus(torch.logsumexp(logit_p, dim=1) + torch.logsumexp(logit_n, dim=1)).mean()
+
+    return loss
 
 def arcface_loss(logits, labels, s=30.0, m=0.50):
     cos_m = math.cos(m)
@@ -61,7 +88,7 @@ def arcface_loss(logits, labels, s=30.0, m=0.50):
     mm = math.sin(math.pi - m) * m
 
     cosine = logits
-    sine = torch.sqrt(1.0 - torch.pow(cosine, 2))
+    sine = torch.sqrt(1.0 - torch.pow(cosine, 2)).to(logits)
     phi = cosine * cos_m - sine * sin_m
     phi = torch.where(cosine > th, phi, cosine - mm)
 
@@ -71,6 +98,15 @@ def arcface_loss(logits, labels, s=30.0, m=0.50):
 
     output = output * s
     return torch.nn.functional.cross_entropy(output, labels)
+
+def simpler_arcface_loss(logits, labels, m=0.5, s=30.0):
+    index = torch.where(labels != -1)[0]
+    m_hot = torch.zeros(index.size()[0], logits.size()[1], device=logits.device)
+    m_hot.scatter_(1, labels[index, None], m)
+    logits.acos_()
+    logits[index] += m_hot
+    logits.cos_().mul_(s)
+    return torch.nn.functional.cross_entropy(logits, labels)
 
 def gem(x, p=3, eps=1e-6):
     return torch.nn.functional.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1./p)
@@ -100,7 +136,7 @@ class WhaleNet(torch.nn.Module):
         }
 
 class InnerNet(torch.nn.Module):
-    def __init__(self, input_shape, encoder_name, encoder_weights, num_identities, global_pool, neck, classifier):
+    def __init__(self, input_shape, encoder_name, encoder_weights, num_identities, global_pool, neck, classifier, features_before_neck):
         super().__init__()
         self.model = timm.create_model(encoder_name, pretrained=encoder_weights is not None)
         self.input_shape = input_shape
@@ -113,29 +149,42 @@ class InnerNet(torch.nn.Module):
             'gem': lambda: torch.nn.Sequential(
                 GeM(),
                 torch.nn.Flatten()
+            ),
+            'fc': lambda: torch.nn.Sequential(
+                torch.nn.BatchNorm2d(self.model.num_features),
+                torch.nn.Dropout(0.3),
+                torch.nn.Flatten(),
+                torch.nn.LazyLinear(512),
+                torch.nn.BatchNorm1d(512)
             )
         }[global_pool]()
 
         self.neck = {
             'identity': lambda: torch.nn.Identity(),
-            'prelu': lambda: torch.nn.Sequential(
+            'fc_bn': lambda: torch.nn.Sequential(
                 torch.nn.Linear(self.model.num_features, 512),
                 torch.nn.BatchNorm1d(512),
                 torch.nn.PReLU()
             )
         }[neck]()
 
-        emgedding_size = self.model.num_features if neck == 'identity' else 512
+        emgedding_size = self.model.num_features if neck == 'identity' and global_pool != 'fc' else 512
 
         self.classifier = {
             'arcface': lambda: ArcfaceHead(emgedding_size, num_identities),
             'fc': lambda: torch.nn.Linear(emgedding_size, num_identities)
         }[classifier]()
 
+        self.features_before_neck = features_before_neck
+
     def forward(self, x):
-        features = self.global_pool(self.model.forward_features(x))
-        features = self.neck(features)
+        pooled_features = self.global_pool(self.model.forward_features(x))
+        features = self.neck(pooled_features)
         logits = self.classifier(features)
+
+        if self.features_before_neck:
+            features = pooled_features
+
         return features, logits
 
     def sample_input(self):
@@ -280,18 +329,25 @@ class TripletLoss(object):
             loss = self.ranking_loss(dist_an - dist_ap, y)
         return loss, dist_ap, dist_an
 
-def compute_loss(outputs, batch, use_arcface, use_triplet):
-    if use_arcface:
-        id_loss = arcface_loss(outputs['individual_logits'], batch['individual_label'])
-    else:
-        id_loss = torch.nn.functional.cross_entropy(outputs['individual_logits'], batch['individual_label'], label_smoothing=0.1)
+def compute_loss(outputs, batch, loss_weights):
+    total_loss = 0.0
+    losses = {
+        'arcface': lambda: arcface_loss(outputs['individual_logits'], batch['individual_label']),
+        'ce': lambda: torch.nn.functional.cross_entropy(outputs['individual_logits'], batch['individual_label'], label_smoothing=0.1),
+        'triplet': lambda: TripletLoss(margin=0.3)(outputs['features'], batch['individual_label'])[0],
+        'pairwise_cosface': lambda: pairwise_cosface(outputs['features'], batch['individual_label'], margin=0.5, gamma=30.0),
+        'simplified_arcface': lambda: simpler_arcface_loss(outputs['individual_logits'], batch['individual_label'])
+    }
 
-    triplet_loss = TripletLoss(margin=0.3)(outputs['features'], batch['individual_label'])[0] * float(use_triplet)
-    total_loss = id_loss + triplet_loss
-    return {'total_loss': total_loss, 'id_loss': id_loss, 'triplet_loss': triplet_loss}
+    loss_values = {}
 
+    for name, weight in loss_weights.items():
+        loss_values[name] = losses[name]()
+        total_loss += loss_values[name] * weight
 
-def transform(input_shape, augment, debug, mapping, num_images_per_identity, enable_flips, record):
+    return {'total_loss': total_loss, **loss_values}
+
+def transform(input_shape, augment, debug, mapping, num_images_per_identity, record):
     if debug:
         import pdb; pdb.set_trace()
 
@@ -312,7 +368,7 @@ def transform(input_shape, augment, debug, mapping, num_images_per_identity, ena
                 albumentations.Resize(input_shape[0], input_shape[1]),
                 albumentations.PadIfNeeded(input_shape[0] + 20, input_shape[1] + 20),
                 albumentations.RandomCrop(height=input_shape[0], width=input_shape[1], p=1.0),
-                albumentations.HorizontalFlip(p=int(enable_flips) / 2.0)
+                albumentations.HorizontalFlip(p=0.5)
             ]
         else:
             steps = [
@@ -352,7 +408,7 @@ class MeanAveragePrecision(Callback):
         if not type(self.features) is np.ndarray:
             self.features = np.stack(self.features)
             self.individual_ids = np.array(self.individual_ids)
-            self.index = faiss.IndexFlatIP(self.features.shape[-1])
+            self.index = faiss.IndexFlatL2(self.features.shape[-1])
             self.index.add(self.features.astype(np.float32))
             res = faiss.StandardGpuResources()
             self.index = faiss.index_cpu_to_gpu(res, 0, self.index)
@@ -407,12 +463,13 @@ def fit(
     num_identities=16,
     num_images_per_identity=4,
     use_phalanx_dataset=False,
-    enable_flips=True,
-    use_triplet=True,
     neck='identity',
     classifier='fc',
     global_pool='avg_pool',
     lr_schedule='regular',
+    features_before_neck=False,
+    loss_weights={'ce': 1.0, 'triplet': 1.0},
+    clip_gradient_norm_to=5.0,
     **kwargs
 ):
     assert len(kwargs) == 0, f'Unrecognized args: {kwargs}'
@@ -425,7 +482,7 @@ def fit(
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-    # torch.autograd.set_detect_anomaly(debug)
+    # torch.autograd.set_detect_anomaly(True)
 
     logger, _ = make_loggers(False)
 
@@ -451,7 +508,8 @@ def fit(
     else:
         model = WhaleNet(InnerNet(
             input_shape, encoder_name, encoder_weights,
-            num_identities=len(df['individual_id'].unique()), global_pool=global_pool, neck=neck, classifier=classifier
+            num_identities=len(df['individual_id'].unique()), global_pool=global_pool, neck=neck, classifier=classifier,
+            features_before_neck=features_before_neck
         ))
 
     model = as_cuda(model)
@@ -490,8 +548,8 @@ def fit(
     val_df['image_paths'] = val_df['individual_id'].map(val_df.groupby('individual_id')['image_path'].apply(list))
     val_df = val_df.drop_duplicates('individual_id')
 
-    train_dataset = TransformedDataset(train_df[:limit], partial(transform, input_shape, True, debug, label_mapping, num_images_per_identity, enable_flips))
-    validation_dataset = TransformedDataset(val_df, partial(transform, val_input_shape, False, debug, label_mapping, num_images_per_identity, enable_flips))
+    train_dataset = TransformedDataset(train_df[:limit], partial(transform, input_shape, True, debug, label_mapping, num_images_per_identity))
+    validation_dataset = TransformedDataset(val_df, partial(transform, val_input_shape, False, debug, label_mapping, num_images_per_identity))
 
     num_workers = 16 if torch.cuda.is_available() and not debug else 0
 
@@ -532,7 +590,7 @@ def fit(
 
     lr_schedule = {
         'regular': lambda:[(0, lr), (40, lr / 10), (70, lr / 100)],
-        'warmup': lambda: [*[(i, lr / (10 - i)) for i in range(10)], (40, lr / 10), (70, lr / 100)]
+        'warmup': lambda: [*[(i, (1 + i) * lr / 10) for i in range(10)], (40, lr / 10), (70, lr / 100)]
     }[lr_schedule]()
 
     callbacks = [
@@ -550,7 +608,7 @@ def fit(
         train_dataloader=train_dataloader,
         validation_dataloader=validation_dataloader,
         optimizer=optimizer,
-        loss_fn=partial(compute_loss, use_arcface=classifier=='arcface', use_triplet=use_triplet),
+        loss_fn=partial(compute_loss, loss_weights=loss_weights),
         num_epochs=num_epochs,
         logger=logger,
         callbacks=callbacks,
@@ -558,7 +616,8 @@ def fit(
         accumulate_n_batches=accumulate_n_batches,
         mixed_precision=mixed_precision,
         profile=profile,
-        profile_path=experiment_path + '_profile'
+        profile_path=experiment_path + '_profile',
+        clip_gradient_norm_to=clip_gradient_norm_to
     )
 
 
