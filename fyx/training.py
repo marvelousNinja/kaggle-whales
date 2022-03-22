@@ -26,7 +26,8 @@ def fit_model(
         accumulate_n_batches=1,
         mixed_precision=False,
         profile=False,
-        profile_path=None
+        profile_path=None,
+        clip_gradient_norm_to=None
     ):
 
     if steps_per_epoch is None:
@@ -68,6 +69,9 @@ def fit_model(
                     scaler.scale(loss_dict['total_loss']).backward()
                 else:
                     loss_dict['total_loss'].backward()
+
+                if clip_gradient_norm_to is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_gradient_norm_to)
 
                 if (i + 1) % accumulate_n_batches == 0:
                     if mixed_precision:
@@ -119,7 +123,7 @@ def fit_model(
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
-            for key in accumulator.keys(): logs[key] = np.mean(accumulator[key])
+            for key in accumulator.keys(): logs[key] = np.nanmean(accumulator[key])
 
             for callback in callbacks: callback.on_epoch_end(logs)
 
