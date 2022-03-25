@@ -27,7 +27,8 @@ def fit_model(
         mixed_precision=False,
         profile=False,
         profile_path=None,
-        clip_gradient_norm_to=None
+        clip_gradient_norm_to=None,
+        channels_last=False
     ):
 
     if steps_per_epoch is None:
@@ -36,6 +37,9 @@ def fit_model(
     train_iterator = looped(train_dataloader)
 
     scaler = torch.cuda.amp.GradScaler()
+
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
 
     with torch.profiler.profile(
         schedule=torch.profiler.schedule(wait=10, warmup=10, active=10, repeat=2),
@@ -58,7 +62,7 @@ def fit_model(
             progress_bar = tqdm(total=num_batches)
             for i in range(num_batches):
                 with torch.cuda.amp.autocast() if mixed_precision else contextlib.nullcontext():
-                    batch = from_numpy(next(train_iterator))
+                    batch = from_numpy(next(train_iterator), channels_last=channels_last)
                     outputs = model(batch)
                     loss_dict = loss_fn(outputs, batch)
 
@@ -70,16 +74,19 @@ def fit_model(
                 else:
                     loss_dict['total_loss'].backward()
 
-                if clip_gradient_norm_to is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_gradient_norm_to)
-
                 if (i + 1) % accumulate_n_batches == 0:
+                    if mixed_precision:
+                        scaler.unscale_(optimizer)
+
+                    if clip_gradient_norm_to is not None and clip_gradient_norm_to > 0.0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_gradient_norm_to)
+
                     if mixed_precision:
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         optimizer.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
 
                 if profile:
                     prof.step()

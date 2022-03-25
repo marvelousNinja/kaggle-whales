@@ -6,13 +6,13 @@ def as_cuda(tensor):
         return tensor.cuda()
     return tensor
 
-def from_numpy(obj):
+def from_numpy(obj, channels_last=False):
 
     if isinstance(obj, dict):
         return {key: from_numpy(value) for key, value in obj.items()}
 
     if torch.cuda.is_available():
-        if isinstance(obj, torch.Tensor): return obj.to('cuda')
+        if isinstance(obj, torch.Tensor): return obj.to('cuda', memory_format=torch.channels_last if channels_last else torch.preserve_format)
         return obj
     else:
         if isinstance(obj, torch.Tensor): return obj
