@@ -9,7 +9,6 @@ import glob
 import numpy as np
 import pandas as pd
 import timm
-import sklearn.metrics.pairwise
 import torch
 from torch.utils.data import Dataset, DataLoader
 
@@ -96,11 +95,15 @@ class InnerNet(torch.nn.Module):
 def predict(
     batch_size=64,
     num_workers=16,
-    model_path='data/experiments/20220316_205046_labelsmoothing01/best.pth',
+    model_path='data/experiments/20220328_195712_arcface_triplet_neck_bn_pool_gem_s_auto_m05/best.pth',
     submission_path='submission.csv',
-    input_shape='256x128',
-    limit=None
+    input_shape='256x256',
+    dataset_name='fullbody',
+    limit=None,
+    **kwargs
 ):
+    assert len(kwargs) == 0, f'Unrecognized args: {kwargs}'
+
     input_shape = tuple(map(int, input_shape.split('x')))
 
     model = WhaleNet(load_checkpoint(model_path))
@@ -110,9 +113,22 @@ def predict(
 
     train_df = pd.read_csv('data/train.csv')
     train_df = train_df.rename(columns={'image': 'image_name'})
-    train_df['image_path'] = 'data/train_images/' + train_df['image_name']
 
-    test_image_paths = glob.glob('data/test_images/**.jpg')
+    if dataset_name == 'default':
+        train_df['image_path'] = 'data/train_images/' + train_df['image_name']
+        test_image_paths = glob.glob('data/test_images/**.jpg')
+    elif dataset_name == 'phalanx':
+        train_df['image_path'] = 'data/cropped_train_images/cropped_train_images/' + train_df['image_name']
+        test_image_paths = glob.glob('data/cropped_test_images/cropped_test_images/**.jpg')
+    elif dataset_name == 'fullbody':
+        train_df['image_path'] = 'data/train/' + train_df['image_name']
+        test_image_paths = glob.glob('data/test/**.jpg')
+    else:
+        raise ValueError(f'Unknown dataset: {dataset_name}')
+
+    train_df['image_path'] = 'data/cropped_train_images/cropped_train_images/' + train_df['image_name']
+    test_image_paths = glob.glob('data/cropped_test_images/cropped_test_images/**.jpg')
+
     test_df = pd.DataFrame({
         'image_path': test_image_paths
     })
@@ -143,7 +159,7 @@ def predict(
     train_df = combined_df[combined_df['individual_id'].notnull()]
     test_df = combined_df[~combined_df['individual_id'].notnull()]
 
-    index = faiss.IndexFlatIP(outputs['features'].shape[-1])
+    index = faiss.IndexFlatL2(outputs['features'].shape[-1])
     index.add(np.stack(train_df['features'].values))
     res = faiss.StandardGpuResources()
     index = faiss.index_cpu_to_gpu(res, 0, index)
