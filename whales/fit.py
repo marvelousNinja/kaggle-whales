@@ -1,6 +1,8 @@
 from datetime import datetime
+import glob
 from functools import partial
 import math
+import itertools
 import os
 import random
 import json
@@ -48,7 +50,7 @@ class TransformedDataset(Dataset):
 class ArcfaceHead(nn.Module):
     def __init__(self, in_features, out_features, num_subcenters):
         super().__init__()
-        self.weight = nn.Parameter(torch.Tensor(out_features * num_subcenters, in_features), requires_grad=False)
+        self.weight = nn.Parameter(torch.Tensor(out_features * num_subcenters, in_features))
         self.num_subcenters = num_subcenters
         nn.init.xavier_uniform_(self.weight)
 
@@ -126,6 +128,42 @@ def simpler_arcface_loss(logits, labels, m=0.5, s=30.0):
     logits.cos_().mul_(s)
     return torch.nn.functional.cross_entropy(logits, labels)
 
+def reimplemented_arcface(logits, labels, m=0.3, s=30.0):
+    logits = logits.clone()
+    threshold = math.cos(math.pi - m)
+    two_d_index = (labels + 1).reshape(-1, 1).nonzero()
+    two_d_index[:, -1] = labels.reshape(-1)
+    target_logits = logits[two_d_index[:, 0], two_d_index[:, 1]]
+
+    sin_theta = torch.sqrt(1 - torch.pow(target_logits, 2))
+    cos_theta_m = target_logits * math.cos(m) - sin_theta * math.sin(m)
+
+    target_logits = torch.where(target_logits > threshold, cos_theta_m.to(target_logits), target_logits) # TODO AS: Stability
+    logits[two_d_index[:, 0], two_d_index[:, 1]] = target_logits
+
+    return torch.nn.functional.cross_entropy(s * logits, labels)
+
+def curricular_face(logits, labels, m=0.3, s=30.0, alpha=0.99, state={'t': 0.0}):
+    logits = logits.clone()
+    threshold = math.cos(math.pi - m)
+    two_d_index = (labels + 1).reshape(-1, 1).nonzero()
+    two_d_index[:, -1] = labels.reshape(-1)
+    target_logits = logits[two_d_index[:, 0], two_d_index[:, 1]]
+    next_t = alpha * state['t'] + (1 - alpha) * target_logits.mean().item()
+
+    sin_theta = torch.sqrt(1 - torch.pow(target_logits, 2))
+    cos_theta_m = target_logits * math.cos(m) - sin_theta * math.sin(m)
+
+    target_logits = torch.where(target_logits > threshold, cos_theta_m.to(target_logits), target_logits) # TODO AS: There was a mix for numerics
+    logits[two_d_index[:, 0], two_d_index[:, 1]] = target_logits
+
+    hard_sample_mask = logits > target_logits[:, None]
+    logits[hard_sample_mask] = (state['t'] * logits[hard_sample_mask]) * logits[hard_sample_mask]
+    if logits.requires_grad:
+        state['t'] = next_t
+
+    return torch.nn.functional.cross_entropy(s * logits, labels)
+
 def gem(x, p=3, eps=1e-6):
     return torch.nn.functional.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1./p)
 
@@ -165,14 +203,15 @@ class InnerNet(torch.nn.Module):
                 torch.nn.Flatten()
             ),
             'gem': lambda: torch.nn.Sequential(
-                GeM(),
+                GeM(), # it sort of adds RELU in the mix, if embedding is small - it significantly damages it
                 torch.nn.Flatten()
             ),
             'flatten': lambda: torch.nn.Sequential(
-                torch.nn.BatchNorm2d(self.model.num_features),
+                torch.nn.BatchNorm2d(self.model.num_features, affine=False),
+                torch.nn.Flatten(),
                 torch.nn.Dropout(0.5),
-                torch.nn.Flatten()
-            )
+            ),
+            'identity': lambda: torch.nn.Identity()
         }[global_pool]()
 
         backbone_embedding_size = self.model.num_features
@@ -184,16 +223,17 @@ class InnerNet(torch.nn.Module):
             'fc': lambda: torch.nn.Linear(backbone_embedding_size, embedding_size),
             'fc_bn': lambda: torch.nn.Sequential(
                 torch.nn.Linear(backbone_embedding_size, embedding_size),
-                torch.nn.BatchNorm1d(embedding_size),
+                torch.nn.BatchNorm1d(embedding_size, affine=False)
             ),
             'fc_bn_prelu': lambda: torch.nn.Sequential(
                 torch.nn.Linear(backbone_embedding_size, embedding_size),
                 torch.nn.BatchNorm1d(embedding_size),
                 torch.nn.PReLU()
             ),
+            'bn': lambda: torch.nn.BatchNorm1d(backbone_embedding_size, affine=False)
         }[neck]()
 
-        if neck == 'identity':
+        if neck == 'identity' or neck == 'bn':
             embedding_size = backbone_embedding_size
 
         self.classifier = {
@@ -207,8 +247,9 @@ class InnerNet(torch.nn.Module):
         original_features = self.model.forward_features(x)
 
         pooled_features = self.global_pool(original_features)
+        pooled_features = pooled_features#.float() # TODO AS: Stability
         features = self.neck(pooled_features)
-        logits = self.classifier(features)
+        logits = self.classifier(features)#.float() # TODO AS: Stability
 
         if self.features_before_neck:
             features = pooled_features
@@ -222,6 +263,9 @@ def convert_to_rgb(tensor):
     image = tensor.permute(1, 2, 0).cpu().numpy()
     image = image[:, :, [0, 0, 0]] if image.shape[2] == 1 else image[:, :, [2, 1, 0]]
     return np.ascontiguousarray(image)
+
+def visualize_embeddings(model, writer, epoch_counter, _):
+    writer.add_embedding(model.model.classifier.weight[:500], tag='class_centers', global_step=epoch_counter)
 
 def visualize_preds(writer, tag, outputs, batch, counter):
     features = outputs['features']
@@ -379,7 +423,13 @@ def compute_loss(outputs, batch, loss_weights):
         'ce_scaled_no_smooth': lambda: torch.nn.functional.cross_entropy(temperature_scaling * outputs['individual_logits'], batch['individual_label']),
         'triplet': lambda: TripletLoss(margin=0.3)(outputs['features'], batch['individual_label'])[0],
         'pairwise_cosface': lambda: pairwise_cosface(outputs['features'], batch['individual_label'], margin=0.5, gamma=temperature_scaling),
-        'simplified_arcface': lambda: simpler_arcface_loss(outputs['individual_logits'], batch['individual_label'], s=temperature_scaling)
+        'simplified_arcface': lambda: simpler_arcface_loss(outputs['individual_logits'], batch['individual_label'], s=temperature_scaling),
+        # TODO AS: python3 -m whales.fit --name arcface_triplet_neck_bn_pool_gem_s_auto_m05 --use-phalanx-dataset --input-shape 256x256 --loss-weights '{reimplemented_arcface:1.0,triplet:1.0}' --classifier arcface --neck bn --global-pool gem --embedding-size 512
+        # TODO AS: python3 -m whales.fit --name fullbody_arcface_notriplet_neck_bn_pool_gem_s_auto_m05_partially32bit_trainable_centers_small_lr_continue_normal_init --dataset-name fullbody --input-shape 256x256 --loss-weights '{reimplemented_arcface:1.0}' --classifier arcface --neck bn --global-pool gem --embedding-size 512 --lr 0.000035
+        # TODO AS: 0.24, was trained with "freeze-unfreeze-switchtoarcface"
+        #  python3 -m whales.fit --name freeze_unfreeze_ce_then_reimpl_arcface_gem_bn_small_lr_64bs --dataset-name fullbody --input-shape 256x256 --loss-weights '{ce:1.0}' --classifier arcface --neck bn --global-pool gem --embedding-size 512 --lr 0.000035 --num-identities-in-batch 64 --num-images-per-identity 1
+        'reimplemented_arcface': lambda: reimplemented_arcface(outputs['individual_logits'], batch['individual_label'], s=temperature_scaling, m=0.5), # It was working well with 64 scaling and zero margin btw
+        'curricular_face': lambda: curricular_face(outputs['individual_logits'], batch['individual_label'], s=temperature_scaling, m=0.5) # It was working well with 64 scaling and zero margin btw
     }
 
     loss_values = {}
@@ -388,9 +438,9 @@ def compute_loss(outputs, batch, loss_weights):
         loss_values[name] = losses[name]()
         total_loss += loss_values[name] * weight
 
-    return {'total_loss': total_loss, **loss_values, 'max_logit': outputs['individual_logits'].max(), 'target_logit': target_logits.mean().item(), 'max_prob': (outputs['individual_logits'] * temperature_scaling).softmax(dim=1).max() }
+    return {'total_loss': total_loss, **loss_values, 'target_logit': target_logits.mean().item()}
 
-def transform(input_shape, augment, debug, mapping, num_images_per_identity, record):
+def transform(input_shape, augment, debug, mapping, num_images_per_identity, toy, color_mapping, record):
     if debug:
         import pdb; pdb.set_trace()
 
@@ -404,18 +454,46 @@ def transform(input_shape, augment, debug, mapping, num_images_per_identity, rec
         # image_paths = record['image_paths'][:num_images_per_identity]
 
     for image_path in image_paths:
-        image = cv2.imread(image_path)
+        if toy:
+            image = np.zeros((512, 512, 3), dtype=np.uint8)
+            h, w = 512, 512 #40 * np.random.randint(2, 10), 40 * np.random.randint(2, 10)
+            top, left = 0, 0#np.random.randint(image.shape[0] - h), np.random.randint(image.shape[1] - w)
+            image = cv2.rectangle(image, (left, top), (left + w, top + h), color_mapping[record['individual_id']], -1).astype(np.uint8)
+        else:
+            image = cv2.imread(image_path)
+
 
         if augment:
             steps = [
-                albumentations.Resize(input_shape[0], input_shape[1]),
-                albumentations.PadIfNeeded(input_shape[0] + 20, input_shape[1] + 20),
-                albumentations.RandomCrop(height=input_shape[0], width=input_shape[1], p=1.0),
-                albumentations.HorizontalFlip(p=0.5)
+                # 1.
+                # albumentations.LongestMaxSize(input_shape[0]),
+                # albumentations.PadIfNeeded(input_shape[0], input_shape[1]),
+                # albumentations.HorizontalFlip(p=0.5),
+
+                # 2.
+                albumentations.SmallestMaxSize(input_shape[0]),
+                albumentations.RandomCrop(input_shape[0], input_shape[1]),
+                albumentations.HorizontalFlip(p=0.5),
+
+                # 3.
+                #albumentations.Resize(input_shape[0], input_shape[1]),
+                #albumentations.PadIfNeeded(input_shape[0] + 20, input_shape[1] + 20),
+                #albumentations.RandomCrop(height=input_shape[0], width=input_shape[1], p=1.0),
+                # # # # # albumentations.ColorJitter(p=0.5),
+                #albumentations.HorizontalFlip(p=0.5)
             ]
         else:
             steps = [
-                albumentations.Resize(input_shape[0], input_shape[1])
+                # 1.
+                # albumentations.LongestMaxSize(input_shape[0]),
+                # albumentations.PadIfNeeded(input_shape[0], input_shape[1]),
+
+                # 2.
+                albumentations.SmallestMaxSize(input_shape[0]),
+                albumentations.CenterCrop(input_shape[0], input_shape[1])
+
+                # 3.
+                # albumentations.Resize(input_shape[0], input_shape[1])
             ]
 
         individual_image = albumentations.Compose(steps)(image=image)['image']
@@ -425,7 +503,8 @@ def transform(input_shape, augment, debug, mapping, num_images_per_identity, rec
             'image_name': os.path.basename(image_path),
             'image_path': image_path,
             'individual_label': mapping[record['individual_id']],
-            'individual_id': record['individual_id']
+            'individual_id': record['individual_id'],
+            'species': record['species']
         })
 
     return records
@@ -433,11 +512,39 @@ def transform(input_shape, augment, debug, mapping, num_images_per_identity, rec
 def accuracy(outputs, batch):
     return (outputs['individual_logits'].argmax(dim=1) == batch['individual_label']).float().mean().item()
 
-class MeanAveragePrecision(Callback):
-    def __init__(self, mapping):
-        self.mapping = mapping
-        pass
+class TrainStats(Callback):
+    def __init__(self):
+        self.cache = []
 
+    def on_train_batch_end(self, logs, outputs, batch):
+        for i in range(len(batch['image'])):
+            self.cache.append({
+                'image_path': batch['image_path'][i],
+                'individual_label': batch['individual_label'][i].item(),
+                'individual_id': batch['individual_id'][i],
+                'species': batch['species'][i]
+            })
+
+    def on_epoch_end(self, logs):
+        df = pd.DataFrame(self.cache)
+        import pdb; pdb.set_trace()
+        self.cache = []
+
+class OnNthEpochDoThis(Callback):
+    def __init__(self, epoch_callback_pairs):
+        self.epoch_callback_pairs = epoch_callback_pairs
+        self.epoch_counter = 0
+
+    def on_epoch_begin(self, logs):
+        for epoch, callback in self.epoch_callback_pairs:
+            if epoch == self.epoch_counter:
+                callback()
+                print(f'Callback called: {callback.__name__}')
+
+        self.epoch_counter += 1
+        return super().on_epoch_begin(logs)
+
+class MeanAveragePrecision(Callback):
     def on_epoch_begin(self, logs):
         self.total = 0
         self.num_records = 0
@@ -446,6 +553,8 @@ class MeanAveragePrecision(Callback):
         self.query_individual_ids = []
         self.query_features = []
         self.index = None
+
+        self.individual_records = []
 
     def on_train_batch_end(self, logs, outputs, batch):
         self.individual_ids.extend(batch['individual_id'])
@@ -460,7 +569,6 @@ class MeanAveragePrecision(Callback):
             res = faiss.StandardGpuResources()
             self.index = faiss.index_cpu_to_gpu(res, 0, self.index)
 
-
         query_individual_ids = np.array(batch['individual_id'])
         query_features = torch.nn.functional.normalize(outputs['features']).cpu().numpy().astype(np.float32)
 
@@ -473,14 +581,31 @@ class MeanAveragePrecision(Callback):
             mapped_record_matches = self.individual_ids[record_matches]
             self.num_records += 1
 
+            record = {
+                'individual_id': batch['individual_id'][i],
+                'species': batch['species'][i]
+            }
+
+            value = 0.0
+
             for j in range(5):
                 if mapped_record_matches[j] == query_individual_ids[i]:
-                    self.total += (1.0 / (j + 1))
+                    value = (1.0 / (j + 1))
                     break
+
+            self.individual_records.append({**record, 'value': value})
+
+            self.total += value
+
 
     def on_epoch_end(self, logs):
         logs['val_mAP'] = self.total / self.num_records
+
+        for key, value in pd.DataFrame(self.individual_records).groupby('species').mean().to_dict()['value'].items():
+            logs[f'val_mAP_{key}'] = value
+
         self.index = None
+        self.individual_records = []
 
 def fit(
     name='default',
@@ -509,7 +634,7 @@ def fit(
     profile=False,
     num_identities_in_batch=16,
     num_images_per_identity=4,
-    use_phalanx_dataset=False,
+    dataset_name='default',
     neck='identity',
     classifier='fc',
     num_subcenters=1,
@@ -519,7 +644,10 @@ def fit(
     loss_weights={'ce': 1.0, 'triplet': 1.0},
     clip_gradient_norm_to=5.0,
     channels_last=True,
-    embedding_size=1024,
+    embedding_size=512,
+    overfit_test=False,
+    augment=True,
+    toy=False,
     **kwargs
 ):
     assert len(kwargs) == 0, f'Unrecognized args: {kwargs}'
@@ -551,7 +679,17 @@ def fit(
 
     validation_batch_size = batch_size if validation_batch_size is None else validation_batch_size
 
-    df = pd.read_csv('data/train.csv')
+    if dataset_name == 'casia':
+        image_path = list(glob.glob('./data/CASIA-WebFace/**/*.jpg')) # image, species, individual id
+        df = pd.DataFrame({'image_path': image_path})
+        df['image'] = df['image_path'].str.split('/').str[-1]
+        df['species'] = 'n/a'
+        df['individual_id'] = df['image_path'].str.split('/').str[-2]
+    else:
+        df = pd.read_csv('data/train.csv')
+
+    # TODO AS: Limiting individual ids
+    # df = df[df['individual_id'].isin(df['individual_id'].unique()[:400])] # 0.73 for 100 identities
 
     if checkpoint_path:
         model = WhaleNet(load_checkpoint(checkpoint_path))
@@ -570,10 +708,16 @@ def fit(
         'adamw': lambda: torch.optim.AdamW(filter(lambda param: param.requires_grad, model.parameters()), lr),
     }[optimizer_name]()
 
-    if use_phalanx_dataset:
-        df['image_path'] = './data/cropped_train_images/cropped_train_images/' + df['image']
-    else:
+    if dataset_name == 'default':
         df['image_path'] = './data/train_images/' + df['image']
+    elif dataset_name == 'phalanx':
+        df['image_path'] = './data/cropped_train_images/cropped_train_images/' + df['image']
+    elif dataset_name == 'fullbody':
+        df['image_path'] = './data/train/' + df['image']
+    elif dataset_name == 'casia':
+        pass
+    else:
+        raise ValueError(f'Unknown dataset: {dataset_name}')
 
     df['species'] = df['species'].replace({
         'globis': 'short_finned_pilot_whale',
@@ -592,15 +736,31 @@ def fit(
     # TODO AS: What is the ratio of "unlabeled" identities? Probe the LB? We can try to tweak it.
     train_df = df[df['fold_id'].isin(train_fold_ids)].copy()
     train_df['image_paths'] = train_df['individual_id'].map(train_df.groupby('individual_id')['image_path'].apply(list))
-    train_df = train_df.drop_duplicates('individual_id')
+    # TODO AS: Balanced sampling
+    # train_df = train_df.drop_duplicates('individual_id')
+    # TODO AS: Leave all the images
+    train_df['image_paths'] = train_df['image_path'].apply(lambda x: [x])
 
     val_df = df[df['fold_id'].isin(validation_fold_ids)].copy()
     val_df = val_df[val_df['individual_id'].isin(train_df['individual_id'].unique())]
     val_df['image_paths'] = val_df['individual_id'].map(val_df.groupby('individual_id')['image_path'].apply(list))
-    val_df = val_df.drop_duplicates('individual_id')
+    # TODO AS: Balanced sampling
+    # val_df = val_df.drop_duplicates('individual_id')
+    # TODO AS: Leave all the images
+    val_df['image_paths'] = val_df['image_path'].apply(lambda x: [x])
 
-    train_dataset = TransformedDataset(train_df[:limit], partial(transform, input_shape, True, debug, label_mapping, num_images_per_identity))
-    validation_dataset = TransformedDataset(val_df, partial(transform, val_input_shape, False, debug, label_mapping, num_images_per_identity))
+    if overfit_test:
+        limit = 1000
+        val_df = train_df[:limit]
+        validation_limit = limit
+        augment = False
+
+    color = range(10, 250, 10)
+    colors = list(itertools.product(color, color, color))
+    np.random.shuffle(colors)
+    color_mapping = dict(zip(label_mapping.keys(), colors[:len(label_mapping.keys())]))
+    train_dataset = TransformedDataset(train_df[:limit], partial(transform, input_shape, augment, debug, label_mapping, num_images_per_identity, toy, color_mapping))
+    validation_dataset = TransformedDataset(val_df, partial(transform, val_input_shape, False, debug, label_mapping, num_images_per_identity, toy, color_mapping))
 
     num_workers = 16 if torch.cuda.is_available() and not debug else 0
 
@@ -644,12 +804,31 @@ def fit(
         'warmup': lambda: [*[(i, (1 + i) * lr / 10) for i in range(10)], (40, lr / 10), (70, lr / 100)]
     }[lr_schedule]()
 
+    def freeze_backbone():
+        for param in model.model.model.parameters():
+            param.requires_grad = False
+
+    def unfreeze_backbone():
+        for param in model.model.model.parameters():
+            param.requires_grad = True
+
+    def switch_to_arcface():
+        for key in list(loss_weights.keys()):
+            del loss_weights[key]
+        loss_weights['reimplemented_arcface'] = 1.0
+
     callbacks = [
-        MeanAveragePrecision(label_mapping),
+        MeanAveragePrecision(),
         Meter('acc', accuracy),
         ModelCheckpoint(model.model, experiment_path, 'val_mAP', 'max', logger),
-        #LRSchedule(optimizer, lr_schedule, logger),
-        TensorboardMonitor(experiment_path, visualize_fn=visualize_preds),
+        # LRSchedule(optimizer, lr_schedule, logger),
+        TensorboardMonitor(experiment_path, visualize_fn=visualize_preds, end_of_epoch_fn=partial(visualize_embeddings, model)),
+        # TrainStats(),
+        # OnNthEpochDoThis([
+        #     (0, freeze_backbone),
+        #     (5, unfreeze_backbone),
+        #     (15, switch_to_arcface)
+        # ])
     ]
 
     if cyclic_lr:
